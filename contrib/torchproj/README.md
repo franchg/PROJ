@@ -36,7 +36,7 @@ pip install -r requirements.txt
 cd contrib/torchproj
 python tmerc_test.py          # likewise for the other *_test.py
 python integ_test.py          # 10 CRS pairs end to end + scale factors vs PROJ
-python integ_bench.py         # CPU throughput against pyproj
+python integ_bench.py --pyproj-threads 4   # CPU throughput against pyproj
 ```
 
 The tests read PROJ's gie vectors from `../../test/gie` and grids from
@@ -63,8 +63,10 @@ xy = T.forward(torch.tensor([[12.5, 41.9]], dtype=torch.float64))
   float64, with identical failure masks. float32 errors are 1.6 to 9.5 m.
 - Scale factors from autograd Jacobians match PROJ's `proj_factors` to about
   1e-10 relative, the precision of PROJ's finite differences.
-- On 4 CPU threads, `torch.compile` runs 1.6 to 7 times faster than pyproj on
-  one thread; eager torch is no faster. No GPU was measured.
+- With both on 4 CPU threads, `torch.compile` runs projections at 0.75 to 1.14
+  times the speed of pyproj (`integ_bench.py --pyproj-threads 4`). The forward
+  NTv2 grid shift is 2.3 to 2.9 times faster, its iterative inverse about half
+  as fast, and eager torch is slower throughout. No GPU was measured.
 
 ## Known defects
 

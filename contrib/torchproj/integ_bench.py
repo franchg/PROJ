@@ -1,10 +1,12 @@
 """CPU benchmark: torch pipeline executor (eager fp64/fp32, torch.compile) vs pyproj.
 
 Run: cd contrib/torchproj && python integ_bench.py [--sizes 1e6,1e7] [--threads 4] [--no-compile]
-       [--cases utm,lcc,obtran,geos,cart,hgrid,hgrid_inv] [--opcount-only]
+       [--cases utm,lcc,obtran,geos,cart,hgrid,hgrid_inv] [--opcount-only] [--pyproj-threads 4]
 All timings are wall clock, best of `--reps` runs, in points/second. pyproj = Transformer
-.transform on float64 numpy arrays (PROJ 9.8.1, single-threaded C). Also prints per-point
-operation counts (from a TorchDispatchMode trace) to reason about GPU throughput.
+.transform on float64 numpy arrays (PROJ 9.8.1, single-threaded C); with --pyproj-threads K it
+is also timed on K threads (K chunks, one Transformer per thread; pyproj releases the GIL).
+Also prints per-point operation counts (from a TorchDispatchMode trace) to reason about GPU
+throughput.
 """
 import argparse
 import gc
@@ -13,6 +15,7 @@ import resource
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -119,6 +122,8 @@ def main():
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--opcount-only", action="store_true")
     ap.add_argument("--compile-chunk", type=float, default=1e6)
+    ap.add_argument("--pyproj-threads", type=int, default=1,
+                    help="also time pyproj on this many threads (0 or 1: single thread only)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     IR.install("generic")
@@ -141,8 +146,11 @@ def main():
         return
 
     print("== throughput (points/s; best of %d) ==" % a.reps)
-    hdr = "  %-9s %9s | %12s | %12s %12s | %12s %12s | %s" % (
-        "case", "N", "pyproj f64", "torch f64", "torch f32", "compiled f64", "compiled f32", "notes")
+    kmt = max(a.pyproj_threads, 1)
+    pool = ThreadPoolExecutor(kmt) if kmt > 1 else None
+    hdr = "  %-9s %9s | %12s %12s | %12s %12s | %12s %12s | %s" % (
+        "case", "N", "pyproj f64", "pyproj x%d" % kmt, "torch f64", "torch f32", "compiled f64",
+        "compiled f32", "notes")
     print(hdr)
     for case in cases:
         defn, lon, lat, D, d = CASES[case]
@@ -174,10 +182,19 @@ def main():
         for n in sizes:
             x64 = make_input(case, n)
             cols = [x64[:, k].copy() for k in range(x64.shape[1])]
-            if d == "fwd":
-                tpy = timeit(lambda: tp.transform(*cols), a.reps)
-            else:
-                tpy = timeit(lambda: tp.transform(*cols, direction="INVERSE"), a.reps)
+            kw = {} if d == "fwd" else {"direction": "INVERSE"}
+            tpy = timeit(lambda: tp.transform(*cols, **kw), a.reps)
+            tpy_mt = float("nan")
+            if pool is not None:
+                tps = [Transformer.from_pipeline(defn) for _ in range(kmt)]
+                cuts = np.linspace(0, n, kmt + 1).astype(int)
+                chunks = [[c[cuts[i]:cuts[i + 1]].copy() for c in cols] for i in range(kmt)]
+
+                def run_mt():
+                    futs = [pool.submit(tps[i].transform, *chunks[i], **kw) for i in range(kmt)]
+                    for f in futs:
+                        f.result()
+                tpy_mt = timeit(run_mt, a.reps)
             res = []
             for dt in (torch.float64, torch.float32):
                 xt = torch.tensor(x64, dtype=dt)
@@ -199,8 +216,8 @@ def main():
                     cres.append(timeit(lambda: [comp[dt](p) for p in parts], a.reps))
                 del xt, parts
             gc.collect()
-            print("  %-9s %9d | %12.3g | %12.3g %12.3g | %12.3g %12.3g | peakRSS %.1f GB" % (
-                case, n, n / tpy, n / res[0], n / res[1], n / cres[0], n / cres[1],
+            print("  %-9s %9d | %12.3g %12.3g | %12.3g %12.3g | %12.3g %12.3g | peakRSS %.1f GB" % (
+                case, n, n / tpy, n / tpy_mt, n / res[0], n / res[1], n / cres[0], n / cres[1],
                 resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6))
         for nt in notes:
             print("            ", nt)
